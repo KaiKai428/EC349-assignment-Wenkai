@@ -1,0 +1,322 @@
+---
+title: "EC349 Assignment Wenkai Li"
+output:
+  pdf_document: default
+  html_document: default
+date: "2023-11-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+
+library(ggplot2)
+library(GGally)
+library(caret)
+library(dplyr)
+library(tidytext)
+library(rpart)
+library(rpart.plot)
+library(glmnet)
+tinytex::install_tinytex(force = TRUE)
+```
+
+# 1. Introduction
+
+In the realm of online consumer feedbacks, Yelp stands out as a pivotal platform for gauging public sentiment towards local businesses. This analysis leverages Yelp's extensive datasets to unravel patterns within users.
+
+# 2. Exploratory Data Analysis
+
+## 2.1 Data Preparation
+
+
+```{r}
+load("yelp_review_small.Rda")
+```
+
+## 2.2 Data Understanding
+
+
+```{r}
+str(review_data_small)
+summary(review_data_small)
+```
+
+## 2.3 Data Cleaning
+
+
+```{r}
+sum(is.na(review_data_small))
+review_data_small$text <- tolower(review_data_small$text)
+review_data_small[duplicated(review_data_small),]
+```
+
+## 2.4 Star Rating Distribution Analysis
+
+
+```{r}
+hist(review_data_small$stars, main="Distribution of Stars", xlab="Stars")
+```
+## 2.5 Votes Analysis
+
+
+```{r}
+boxplot(review_data_small$useful, main="Boxplot of Useful Votes", ylab="Number of Useful Votes")
+boxplot(review_data_small$funny, main="Boxplot of Funny Votes", ylab="Number of Funny Votes")
+boxplot(review_data_small$cool, main="Boxplot of Cool Votes", ylab="Number of Cool Votes")
+```
+
+
+## 2.6 Correlation Analysis
+ 
+
+```{r}
+ggpairs(review_data_small, columns = c("stars", "useful", "funny", "cool"), 
+        title = "Scatterplot Matrix for Correlation Analysis", progress = FALSE)
+```
+
+## 2.7 Review Text Length Analysis
+
+
+```{r}
+review_data_small$text_length <- nchar(review_data_small$text)
+hist(review_data_small$text_length, main="Distribution of Review Text Length", xlab="Text Length")
+```
+
+## 2.8 Time Trend Analysis
+
+
+```{r}
+review_data_small$date <- as.Date(review_data_small$date)
+plot(table(review_data_small$date), type="l", main="Number of Reviews Over Time", xlab="Date", ylab="Number of Reviews")
+```
+
+# 3. Model building
+
+## 3.1 Feature Engineering
+
+In the feature engineering phase for the Yelp reviews dataset, sentiment analysis was employed to quantify the emotional tone of each review. The 'bing' lexicon was selected for its comprehensive coverage of common language sentiments, making it well-suited for the diverse expressions found in Yelp reviews. Using a 'bing' lexicon, words are categorized as positive or negative and assigned numerical values (+1 or -1). The process involves tokenizing reviews, matching words to the lexicon, and summing values to create a sentiment score per review.
+
+Additionally, average star ratings and review count for users and businesses are calculated. User ratings are determined by averaging historical review scores per user, while business ratings are averaged based on all reviews for each business. These ratings are integrated into the dataset, providing insights into user preferences and business reputations.
+
+```{r}
+sentiments <- get_sentiments("bing") %>%
+  mutate(score = ifelse(sentiment == "positive", 1, -1))
+
+sentiment_scores <-  review_data_small %>%
+  unnest_tokens(word, text) %>%
+  inner_join(sentiments, by = "word") %>%
+  group_by(review_id) %>%
+  summarize(sentiment_score = sum(score)) 
+
+sentiment_scores <- na.omit(sentiment_scores)
+review_data_small <- left_join(review_data_small, sentiment_scores, by = "review_id")
+
+
+avg_user_rating <- review_data_small %>%
+  group_by(user_id) %>%
+  summarize(avg_stars = mean(stars, na.rm = TRUE))
+review_data_small <- merge(review_data_small, avg_user_rating, by = "user_id")
+
+user_review_count <- review_data_small %>%
+  group_by(user_id) %>%
+  summarize(review_count = n())
+review_data_small <- merge(review_data_small, user_review_count, by = "user_id")
+
+
+avg_business_rating <- review_data_small %>%
+  group_by(business_id) %>%
+  summarize(avg_stars = mean(stars, na.rm = TRUE))
+review_data_small <- merge(review_data_small, avg_business_rating, by = "business_id")
+
+business_review_count <- review_data_small %>%
+  group_by(business_id) %>%
+  summarize(review_count = n())
+review_data_small <- merge(review_data_small, business_review_count, by = "business_id")
+
+review_data_small <- na.omit(review_data_small)
+```
+
+## 3.2 Data Splitting
+
+The dataset `review_data_small` was partitioned into a training set and a test set. A random seed was set using set.seed(1) to ensure reproducibility of the data splitting process.
+
+An 80/20 partition for the training and test sets is a standard practice that often provides a balanced trade-off between learning complexity and validation accuracy. Following the specified proportion (p = .80), which comprises 1,118,445 observations, serving as the primary dataset for model training.
+
+The remaining 20% of the data, amounting to 279,611 observations, was designated as test_set, which will be instrumental in evaluating the model's performance and its generalizability to unseen data.
+
+```{r}
+set.seed(1)
+trainIndex <- createDataPartition(review_data_small$stars, p = .80, 
+                                  list = FALSE, 
+                                  times = 1)
+
+train_set <- review_data_small[trainIndex, ]
+test_set <- review_data_small[-trainIndex, ]
+
+nrow(train_set) 
+nrow(test_set)  
+```
+
+
+## 3.3 Model Selection
+
+Each model was chosen based on its unique strengths: linear regression for its simplicity and interpretability, the decision tree for its ability to capture non-linear relationships, and Lasso regression for feature selection and handling multicollinearity.
+
+### 3.3.1 linear regression model
+In analyzing the performance of the baseline linear regression model on Yelp data, the spread of residuals between -3.9197 and 3.7888, with a median approaching zero, indicates a symmetric distribution around the predicted values, suggesting the model's adequacy.
+
+Key predictors, including sentiment_score, avg_stars.x (average user rating), avg_stars.y (average business rating), review_count.x (user review count), and review_count.y (business review count), are identified as significant due to their low p-values (<2e-16). The coefficients of these variables highlight their respective impacts on the predicted star rating, notably with avg_stars.x exerting the most substantial positive influence.
+
+The model's fit is evidenced by a substantial proportion of variance explained in the response variable (Multiple R-squared: 0.7497). Additionally, the F-statistic and its associated p-value (<2.2e-16) affirm the overall significance of the model. This demonstrates the model's strong predictive power and provides valuable insights into the factors influencing Yelp users' ratings.
+```{r}
+fitControl <- trainControl(method = "repeatedcv",
+                           number = 10,  
+                           repeats = 3)  
+
+set.seed(1)  
+
+lm_model <- train(stars ~ sentiment_score + avg_stars.x + avg_stars.y + review_count.x + review_count.y,
+                  data = train_set, 
+                  method = "lm",
+                  trControl = fitControl)
+
+summary(lm_model)
+```
+
+### 3.3.2 Decision tree model
+
+The decision tree model provides a structured approach to predicting user ratings on Yelp. The tree splits the data based on certain conditions, leading to a set of terminal nodes that represent the model's predictions. 
+
+The decision tree model's prioritization of splits based on the average user rating suggests that users' historical rating behavior is a strong indicator of their future ratings. This insight could guide businesses in targeting customer segments more effectively. Further splits involve sentiment_score and the average business rating, indicating their relevance.
+
+Each node represents a subset of the data with similar characteristics. For example, the leftmost terminal node with an average rating of 1.1 reflects conditions where user ratings are very low, likely influenced by corresponding low sentiment scores and user ratings.
+
+Variable importance scores affirm the average user rating's dominance as a predictor, followed by sentiment score and business rating.
+
+```{r}
+set.seed(1)
+decision_tree_model <- rpart(stars ~ sentiment_score + avg_stars.x + avg_stars.y + review_count.x + review_count.y,
+                             data = train_set, 
+                             method = "anova")
+
+summary(decision_tree_model)
+
+rpart.plot(decision_tree_model)
+```
+
+### 3.3.3 Lasso regression model
+
+Lasso regression, applied to the Yelp dataset, effectively facilitates feature selection by omitting non-essential predictors, exemplified by the minimal impact of review counts.
+
+The Lasso's penalization approach adeptly manages potential multicollinearity among predictors. Analysis of the Lasso regression output and the coefficient-lambda plot reveals several insights:
+
+The glmnet model has successfully fitted a series of Lasso models across a range of lambda values, indicating model convergence.
+Notably, avg_stars.x and avg_stars.y maintain non-zero coefficients throughout varying lambda values, demonstrating their consistent and significant impact on the response variable, stars.
+
+As lambda decreases in the Lasso regression, the sentiment_score's coefficient becomes more prominent, indicating its increased relevance in the presence of less regularization and affirming its role in predicting user ratings, suggesting its increased relevance under reduced regularization.
+
+Conversely, review_count.x and review_count.y exhibit diminishing coefficients across the lambda spectrum, implying their limited significance in the model.
+
+```{r}
+x <- model.matrix(stars ~ sentiment_score + avg_stars.x + avg_stars.y + review_count.x + review_count.y - 1, data = train_set)
+
+y <- train_set$stars
+
+set.seed(1)
+lasso_model <- glmnet(x, y, alpha = 1)  # alpha = 1 indicates Lasso regression
+
+print(coef(lasso_model))
+
+plot(lasso_model, xvar = "lambda", label = TRUE)
+```
+
+# 4. Model Evaluation
+
+The Mean Squared Error (MSE) metric, utilized to evaluate the predictive accuracy of three regression models, measures the average squared difference between observed actual outcomes and model predictions. A lower MSE denotes greater precision in prediction.
+
+Analysis of MSE values across the models reveals:
+
+The Linear Regression model records an MSE of 0.5868, indicating the highest accuracy in predictions for this dataset.
+The Decision Tree model, with a slightly elevated MSE of 0.6261, demonstrates a modest reduction in predictive performance relative to the Linear Regression model.
+The Lasso Regression model, exhibiting the highest MSE of 0.7596, shows comparatively less accuracy in its predictions on this dataset.
+
+```{r}
+linear_predictions <- predict(lm_model, newdata = test_set)
+decision_tree_predictions <- predict(decision_tree_model, newdata = test_set)
+x_test <- model.matrix(~ sentiment_score + avg_stars.x + avg_stars.y + review_count.x + review_count.y - 1, data = test_set)
+
+lasso_predictions <- predict(lasso_model, newx = x_test)
+
+linear_mse <- mean((test_set$stars - linear_predictions) ^ 2)
+decision_tree_mse <- mean((test_set$stars - decision_tree_predictions) ^ 2)
+lasso_mse <- mean((test_set$stars - lasso_predictions) ^ 2)
+
+print(paste("Linear Regression MSE:", linear_mse))
+print(paste("Decision Tree MSE:", decision_tree_mse))
+print(paste("Lasso Regression MSE:", lasso_mse))
+```
+
+# 5. Model Sellection
+
+For predicting Yelp user reviews, the Linear Regression model was selected, primarily due to its superior performance on the test dataset, as indicated by the lowest Mean Squared Error (MSE = 0.5868) among the evaluated models. This model strikes an optimal balance between accuracy, complexity, and interpretability, essential in academic contexts where explainability is as crucial as predictive efficiency.
+
+The choice was further influenced by the model's simplicity and robustness. Linear models, known for their ease of interpretation and resistance to overfitting, are particularly suitable for large datasets, ensuring reliable generalization to new data.
+
+Additionally, the Linear Regression model's capacity to elucidate the influence of each predictor on user ratings aligns with the project's goals. This aspect is not only academically valuable but also offers practical insights, such as pinpointing factors that affect user satisfaction.
+
+In summary, the Linear Regression model's combination of predictive accuracy, straightforwardness, interpretability, and analytical depth renders it the optimal choice for this project.
+
+# 6. Discussion
+
+The scatterplot matrix from the preliminary analysis indicated that the variables `useful`, `funny`, and `cool` have weak correlations with `stars`, the dependent variable. Given their negligible correlation coefficients and considering parsimony in model building, these variables were not included as predictors to avoid overfitting and to maintain model interpretability.
+
+The exclusion of time and text length as variables in the predictive models was based on a careful evaluation of their relevance and impact. The `date` variable, although it could reveal trends over time, is not a direct influencer of individual ratings and could potentially add unnecessary complexity to the model. Similarly, text length might indicate the detail within a review but does not inherently relate to the sentiment expressed or the star rating given. Therefore, to prioritize direct, impactful variables and maintain model clarity and efficiency, both time and text length were omitted from the modeling process.
+
+# 7. DS Methodology
+The DS Methodology I chose for this project is CRISP-DM, which includes six sequential but iterative stages,from business understanding,data understanding,data preparation, modelling,evaluation to development. The main reason why I chose this methodology is becuase the process is intuitive and flexible. The way how I apply this methodology is detailed in this markdown file that I went through each stage above.
+
+# 8.Academic intergerity
+Tabula statement
+
+We're part of an academic community at Warwick.
+
+Whether studying, teaching, or researching, we’re all taking part in an expert conversation which must meet standards of academic integrity. When we all meet these standards, we can take pride in our own academic achievements, as individuals and as an academic community.
+
+Academic integrity means committing to honesty in academic work, giving credit where we've used others' ideas and being proud of our own achievements.
+
+In submitting my work I confirm that:
+
+1. I have read the guidance on academic integrity provided in the Student Handbook and understand the University regulations in relation to Academic Integrity. I am aware of the potential consequences of Academic Misconduct.
+
+2. I declare that the work is all my own, except where I have stated otherwise.
+
+3. No substantial part(s) of the work submitted here has also been submitted by me in other credit bearing assessments courses of study (other than in certain cases of a resubmission of a piece of work), and I acknowledge that if this has been done this may lead to an appropriate sanction.
+
+4. Where a generative Artificial Intelligence such as ChatGPT has been used I confirm I have abided by both the University guidance and specific requirements as set out in the Student Handbook and the Assessment brief. I have clearly acknowledged the use of any generative Artificial Intelligence in my submission, my reasoning for using it and which generative AI (or AIs) I have used. Except where indicated the work is otherwise entirely my own.
+
+5. I understand that should this piece of work raise concerns requiring investigation in relation to any of points above, it is possible that other work I have submitted for assessment will be checked, even if marks (provisional or confirmed) have been published.
+
+6. Where a proof-reader, paid or unpaid was used, I confirm that the proofreader was made aware of and has complied with the University’s proofreading policy.
+
+7. I consent that my work may be submitted to Turnitin or other analytical technology. I understand the use of this service (or similar), along with other methods of maintaining the integrity of the academic process, will help the University uphold academic standards and assessment fairness.
+
+Privacy statement
+
+The data on this form relates to your submission of coursework. The date and time of your submission, your identity, and the work you have submitted will be stored. We will only use this data to administer and record your coursework submission.
+
+Related articles
+
+Reg. 11 Academic Integrity (from 4 Oct 2021)
+
+Guidance on Regulation 11
+
+Proofreading Policy  
+
+Education Policy and Quality Team
+
+Academic Integrity (warwick.ac.uk)
+
+This is the end of the statement to be included.
+
+word count:1218
